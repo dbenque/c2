@@ -30,6 +30,8 @@ type Coordinator struct {
 	endpoint        endpointRegistry.Endpoint         // Endpoint for this coordinator
 	cluster         coordinators                      // Cluster of coordinators ID->Coordinator
 	failingEndpoint map[string]int                    // Endpoint Failures detection
+	//	registrationTicker <-chan Time
+	//	refreshClusterTicker <-chan Time
 }
 
 var instanceCoordinator *Coordinator
@@ -43,12 +45,13 @@ func InitCoordinator(ID int, endpoint endpointRegistry.Endpoint, store distribut
 		ID,
 		endpoint,
 		make(coordinators),
-		make(map[string]int)}
+		make(map[string]int),
+	}
 
 	// Self Register frequently
 	go func() {
 		c := time.Tick(SelfRegistrationInterval)
-		for range c {
+		for _ = range c {
 			if instanceCoordinator != nil && instanceCoordinator.registry != nil {
 				var listEndpoint []endpointRegistry.Endpoint
 				listEndpoint = append(listEndpoint, instanceCoordinator.endpoint)
@@ -60,7 +63,7 @@ func InitCoordinator(ID int, endpoint endpointRegistry.Endpoint, store distribut
 	// Refresh cluster frequently (and clean failing endpoints)
 	go func() {
 		c := time.Tick(RefreshClusterInterval)
-		for range c {
+		for _ = range c {
 			if instanceCoordinator != nil && instanceCoordinator.registry != nil {
 				instanceCoordinator.refreshCluster()
 			}
