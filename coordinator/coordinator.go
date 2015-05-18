@@ -21,56 +21,80 @@ const (
 	RefreshClusterInterval   = 4 * time.Second    // Interval for refresh of the cluster
 )
 
-type coordinators map[int]Coordinator
+type CoordinatorID int
+type coordinatorsIndex struct {
+	sync.Mutex
+	index map[CoordinatorID]*Coordinator
+}
+
+func newCoordinatorsIndex() *coordinatorsIndex {
+	return &coordinatorsIndex{index: make(map[CoordinatorID]*Coordinator)}
+}
+
+type endpointsFailure struct {
+	sync.Mutex
+	count map[string]int // count of failure for a given endpoint (key = endpoint.String())
+}
+
+func newEndpointsFailure() *endpointsFailure {
+	return &endpointsFailure{count: make(map[string]int)}
+}
+
+type coordinatorInfoGetterFct func(endpointRegistry.Endpoint) (*Coordinator, error)
 
 type Coordinator struct {
-	store           distributedStore.DistributedStore // Resource to store task to be coordinated (couchbase, ETCD, redis, ...)
-	registry        endpointRegistry.EndpointRegistry // Resource to register coordinator endpoint (couchbase, loadbalancer ...)
-	ID              int                               // ID of the coordinator
-	endpoint        endpointRegistry.Endpoint         // Endpoint for this coordinator
-	cluster         coordinators                      // Cluster of coordinators ID->Coordinator
-	failingEndpoint map[string]int                    // Endpoint Failures detection
-	//	registrationTicker <-chan Time
-	//	refreshClusterTicker <-chan Time
+	store                 distributedStore.DistributedStore // Resource to store task to be coordinated (couchbase, ETCD, redis, ...)
+	registry              endpointRegistry.EndpointRegistry // Resource to register coordinator endpoint (couchbase, loadbalancer ...)
+	ID                    CoordinatorID                     // ID of the coordinator
+	endpoint              endpointRegistry.Endpoint         // Endpoint for this coordinator
+	cluster               *coordinatorsIndex                // Cluster of coordinators ID->Coordinator
+	failingEndpoint       *endpointsFailure                 // Endpoint Failures detection
+	registrationTicker    *time.Ticker                      // Time to register again and again and again
+	refreshClusterTicker  *time.Ticker                      // Time to refresh cluster again and again and again
+	coordinatorInfoGetter coordinatorInfoGetterFct          // How to retrieve the Coordinator info when you have a endpoint (usually http call, except for unittest)
 }
 
 var instanceCoordinator *Coordinator
 
 //InitCoordinator this create the Coordinator resource and launch all the process for automatic registration and cluster discovery (and cleaning)
-func InitCoordinator(ID int, endpoint endpointRegistry.Endpoint, store distributedStore.DistributedStore, registry endpointRegistry.EndpointRegistry) (*Coordinator, error) {
+func NewCoordinator(ID CoordinatorID, endpoint endpointRegistry.Endpoint, store distributedStore.DistributedStore, registry endpointRegistry.EndpointRegistry) (*Coordinator, error) {
 
-	instanceCoordinator = &Coordinator{
+	c := Coordinator{
 		store,
 		registry,
 		ID,
 		endpoint,
-		make(coordinators),
-		make(map[string]int),
+		newCoordinatorsIndex(),
+		newEndpointsFailure(),
+		time.NewTicker(SelfRegistrationInterval),
+		time.NewTicker(RefreshClusterInterval),
+		getCoordinatorInfoForEndPoint,
 	}
 
+	// set the instance
+	instanceCoordinator = &c
+	return instanceCoordinator, nil
+}
+
+func (c *Coordinator) Start() {
 	// Self Register frequently
 	go func() {
-		c := time.Tick(SelfRegistrationInterval)
-		for _ = range c {
-			if instanceCoordinator != nil && instanceCoordinator.registry != nil {
-				var listEndpoint []endpointRegistry.Endpoint
-				listEndpoint = append(listEndpoint, instanceCoordinator.endpoint)
-				instanceCoordinator.registry.AddEndpoints(listEndpoint)
-			}
+		for _ = range c.registrationTicker.C {
+			c.registry.AddEndpoints([]endpointRegistry.Endpoint{c.endpoint})
 		}
 	}()
 
 	// Refresh cluster frequently (and clean failing endpoints)
 	go func() {
-		c := time.Tick(RefreshClusterInterval)
-		for _ = range c {
-			if instanceCoordinator != nil && instanceCoordinator.registry != nil {
-				instanceCoordinator.refreshCluster()
-			}
+		for _ = range c.refreshClusterTicker.C {
+			instanceCoordinator.refreshCluster()
 		}
 	}()
+}
 
-	return instanceCoordinator, nil
+func (c *Coordinator) Stop() {
+	c.registrationTicker.Stop()
+	c.refreshClusterTicker.Stop()
 }
 
 func (c *Coordinator) refreshCluster() error {
@@ -80,9 +104,7 @@ func (c *Coordinator) refreshCluster() error {
 		return err
 	}
 
-	newCluster := make(coordinators)
-
-	var mutex = &sync.Mutex{}
+	newCluster := newCoordinatorsIndex()
 
 	var wg sync.WaitGroup
 	for _, ep := range ePoints {
@@ -90,47 +112,55 @@ func (c *Coordinator) refreshCluster() error {
 		// poll endpoint in parallel
 		go func(epoint endpointRegistry.Endpoint) {
 			defer wg.Done()
-			if otherCoordinator, errep := getCoordinatorInfoForEndPoint(epoint); errep == nil {
-				mutex.Lock()
-				newCluster[otherCoordinator.ID] = *otherCoordinator
-				mutex.Unlock()
+			otherCoordinator, errep := c.coordinatorInfoGetter(epoint)
 
-				// TODO I should mutex the failingEndpoint map !!!
-				delete(c.failingEndpoint, epoint.String())
+			// protect the failure map from concurrent access since we play with multiple endpoints in parallel
+			c.failingEndpoint.Lock()
+			defer c.failingEndpoint.Unlock()
+
+			if errep == nil {
+
+				// Ok we got the coordinator associated to the endpoint
+				newCluster.Lock()
+				newCluster.index[otherCoordinator.ID] = otherCoordinator
+				newCluster.Unlock()
+
+				// In case it was register as failing, clear because now it is fine
+				delete(c.failingEndpoint.count, epoint.String())
 
 			} else {
-				if count, ok := c.failingEndpoint[epoint.String()]; ok {
+
+				// Bad new this endpoint is not responding!
+				count, ok := c.failingEndpoint.count[epoint.String()]
+				if ok {
 					count++
-
-					// TODO I should mutex the failingEndpoint map !!!
-					c.failingEndpoint[epoint.String()] = count
-					if count > MaxFailureBeforeRemove {
-						var epl []endpointRegistry.Endpoint
-						if err := c.registry.RemoveEndpoints(append(epl, epoint)); err == nil {
-							delete(c.failingEndpoint, epoint.String())
-							log.Println("Removing a failing endpoint: ", epoint.String())
-						}
-
-					}
 				} else {
-					// add as failing endpoint
-					c.failingEndpoint[epoint.String()] = 1
+					count = 1
 				}
+				c.failingEndpoint.count[epoint.String()] = count
+
+				// Check against max autorized failure before eviction
+				if count > MaxFailureBeforeRemove {
+					if err := c.registry.RemoveEndpoints([]endpointRegistry.Endpoint{epoint}); err == nil {
+						delete(c.failingEndpoint.count, epoint.String())
+						log.Println("Removing a failing endpoint: ", epoint.String())
+					}
+				}
+
 			}
 		}(ep)
 	}
 	wg.Wait()
 
-	// TODO I should mutex the cluster map !!!
+	// Be carefull the cluster can be modified while you are working with it. Get the pointer to cluster and keep working with it till the end of your logic to be consistent
 	c.cluster = newCluster
 
 	return nil
 }
 
-// HandleGetCoordinatorInfo handler to register to the webserver associated to the coordinator. This returns the information of the coordinator.
-func HandleGetCoordinatorInfo(w http.ResponseWriter, r *http.Request) {
+func (c *Coordinator) GetCoordinatorInfo(w http.ResponseWriter, r *http.Request) {
 
-	if instanceCoordinator == nil {
+	if c == nil {
 		w.WriteHeader(http.StatusInternalServerError)
 		w.Header().Set("Content-Type", "text/plain")
 		io.WriteString(w, "The coordinator was not initialized")
@@ -139,7 +169,7 @@ func HandleGetCoordinatorInfo(w http.ResponseWriter, r *http.Request) {
 
 	// this is what is going to be read after in getCoordinatorInfoForEndPoint by other coordinator of the cluster
 	// Pay attention to forward compatibility here when changing the Coordinator Struct
-	buffer, err := json.Marshal(*instanceCoordinator)
+	buffer, err := json.Marshal(*c)
 
 	if err != nil {
 		w.WriteHeader(http.StatusInternalServerError)

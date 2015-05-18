@@ -52,8 +52,7 @@ func (cb *CBConnection) AddUniqueInStrList(listName string, value string) error 
 				// TODO test that it is a error type miss and nothing else
 
 				// create the list
-				listStr := append(listStr, value)
-				cb.bucket.Set(listName, 0, listStr)
+				cb.bucket.Set(listName, 0, []string{value})
 				c <- true
 				return
 			}

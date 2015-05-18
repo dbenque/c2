@@ -44,7 +44,7 @@ func main() {
 
 	// Register the handler to get the coordinator information
 	r := mux.NewRouter()
-	r.HandleFunc("/"+coordinator.CoordinatorInfoService, coordinator.HandleGetCoordinatorInfo)
+	r.HandleFunc("/"+coordinator.CoordinatorInfoService, handleGetCoordinatorInfo)
 	http.Handle("/", r)
 
 	err := http.ListenAndServe(":"+strconv.Itoa(port), nil)
@@ -58,6 +58,8 @@ func main() {
 
 }
 
+var coordinatorInstance *coordinator.Coordinator
+
 func initResources() error {
 
 	registry, err := endpointRegistry.NewCouchbaseEndpointRegistry(cb_bucket, cb_uri)
@@ -65,9 +67,16 @@ func initResources() error {
 		return err
 	}
 
-	coordinator.InitCoordinator(coordinatorID,
+	coordinatorInstance, err = coordinator.NewCoordinator(coordinator.CoordinatorID(coordinatorID),
 		endpointRegistry.Endpoint{net.TCPAddr{net.IPv4(127, 0, 0, 1), port, ""}},
 		nil,
 		registry)
+	coordinatorInstance.Start()
 	return nil
+}
+
+func handleGetCoordinatorInfo(w http.ResponseWriter, r *http.Request) {
+
+	coordinatorInstance.GetCoordinatorInfo(w, r)
+
 }
