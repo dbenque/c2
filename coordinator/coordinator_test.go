@@ -23,7 +23,8 @@ type coordinatorsByEndpointForTest struct {
 }
 
 func newTestCoordinator(ID CoordinatorID, endpoint endpointRegistry.Endpoint, store distributedStore.DistributedStore, registry endpointRegistry.EndpointRegistry, allCoordinators *coordinatorsByEndpointForTest) *Coordinator {
-	c, _ := NewCoordinator(ID, endpoint, store, registry)
+	c, _ := NewCoordinator(ID, store, registry)
+	c.SetEndpoint(&endpoint)
 
 	c.registrationTicker = time.NewTicker(testRegistrationTickerDuration)
 	c.refreshClusterTicker = time.NewTicker(testRefreshClusterTickerDuration)

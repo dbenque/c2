@@ -2,6 +2,7 @@ package coordinator
 
 import (
 	"encoding/json"
+	"errors"
 	"io"
 	"io/ioutil"
 	"log"
@@ -46,7 +47,7 @@ type Coordinator struct {
 	store                 distributedStore.DistributedStore // Resource to store task to be coordinated (couchbase, ETCD, redis, ...)
 	registry              endpointRegistry.EndpointRegistry // Resource to register coordinator endpoint (couchbase, loadbalancer ...)
 	ID                    CoordinatorID                     // ID of the coordinator
-	endpoint              endpointRegistry.Endpoint         // Endpoint for this coordinator
+	endpoint              *endpointRegistry.Endpoint        // Endpoint for this coordinator
 	cluster               *coordinatorsIndex                // Cluster of coordinators ID->Coordinator
 	failingEndpoint       *endpointsFailure                 // Endpoint Failures detection
 	registrationTicker    *time.Ticker                      // Time to register again and again and again
@@ -57,13 +58,13 @@ type Coordinator struct {
 var instanceCoordinator *Coordinator
 
 //InitCoordinator this create the Coordinator resource and launch all the process for automatic registration and cluster discovery (and cleaning)
-func NewCoordinator(ID CoordinatorID, endpoint endpointRegistry.Endpoint, store distributedStore.DistributedStore, registry endpointRegistry.EndpointRegistry) (*Coordinator, error) {
+func NewCoordinator(ID CoordinatorID, store distributedStore.DistributedStore, registry endpointRegistry.EndpointRegistry) (*Coordinator, error) {
 
 	c := Coordinator{
 		store,
 		registry,
 		ID,
-		endpoint,
+		nil,
 		newCoordinatorsIndex(),
 		newEndpointsFailure(),
 		time.NewTicker(SelfRegistrationInterval),
@@ -80,14 +81,20 @@ func (c *Coordinator) Start() {
 	// Self Register frequently
 	go func() {
 		for _ = range c.registrationTicker.C {
-			c.registry.AddEndpoints([]endpointRegistry.Endpoint{c.endpoint})
+			if c.endpoint == nil {
+				return
+			}
+			c.registry.AddEndpoints([]endpointRegistry.Endpoint{*c.endpoint})
 		}
 	}()
 
 	// Refresh cluster frequently (and clean failing endpoints)
 	go func() {
 		for _ = range c.refreshClusterTicker.C {
-			instanceCoordinator.refreshCluster()
+			if c.endpoint == nil {
+				return
+			}
+			c.refreshCluster()
 		}
 	}()
 }
@@ -97,65 +104,20 @@ func (c *Coordinator) Stop() {
 	c.refreshClusterTicker.Stop()
 }
 
-func (c *Coordinator) refreshCluster() error {
+func (c *Coordinator) SetEndpoint(e *endpointRegistry.Endpoint) {
+	c.endpoint = e
+}
 
-	ePoints, err := c.registry.GetEndpoints()
-	if err != nil {
-		return err
+//Redirect search the coordinator endpoint assiociated to the ID and redirect the request
+func (c *Coordinator) Redirect(ID CoordinatorID, w http.ResponseWriter, r *http.Request) error {
+
+	if targetCoordinator, ok := c.cluster.index[ID]; ok {
+		http.Redirect(w, r, targetCoordinator.endpoint.String(), http.StatusFound)
+		return nil
 	}
 
-	newCluster := newCoordinatorsIndex()
+	return errors.New("Unknown ID in the cluster")
 
-	var wg sync.WaitGroup
-	for _, ep := range ePoints {
-		wg.Add(1)
-		// poll endpoint in parallel
-		go func(epoint endpointRegistry.Endpoint) {
-			defer wg.Done()
-			otherCoordinator, errep := c.coordinatorInfoGetter(epoint)
-
-			// protect the failure map from concurrent access since we play with multiple endpoints in parallel
-			c.failingEndpoint.Lock()
-			defer c.failingEndpoint.Unlock()
-
-			if errep == nil {
-
-				// Ok we got the coordinator associated to the endpoint
-				newCluster.Lock()
-				newCluster.index[otherCoordinator.ID] = otherCoordinator
-				newCluster.Unlock()
-
-				// In case it was register as failing, clear because now it is fine
-				delete(c.failingEndpoint.count, epoint.String())
-
-			} else {
-
-				// Bad new this endpoint is not responding!
-				count, ok := c.failingEndpoint.count[epoint.String()]
-				if ok {
-					count++
-				} else {
-					count = 1
-				}
-				c.failingEndpoint.count[epoint.String()] = count
-
-				// Check against max autorized failure before eviction
-				if count > MaxFailureBeforeRemove {
-					if err := c.registry.RemoveEndpoints([]endpointRegistry.Endpoint{epoint}); err == nil {
-						delete(c.failingEndpoint.count, epoint.String())
-						log.Println("Removing a failing endpoint: ", epoint.String())
-					}
-				}
-
-			}
-		}(ep)
-	}
-	wg.Wait()
-
-	// Be carefull the cluster can be modified while you are working with it. Get the pointer to cluster and keep working with it till the end of your logic to be consistent
-	c.cluster = newCluster
-
-	return nil
 }
 
 func (c *Coordinator) GetCoordinatorInfo(w http.ResponseWriter, r *http.Request) {
@@ -199,4 +161,68 @@ func getCoordinatorInfoForEndPoint(endPoint endpointRegistry.Endpoint) (*Coordin
 	}
 
 	return c, nil
+}
+
+func (c *Coordinator) refreshCluster() error {
+
+	ePoints, err := c.registry.GetEndpoints()
+	if err != nil {
+		return err
+	}
+
+	newCluster := newCoordinatorsIndex()
+
+	var wg sync.WaitGroup
+	for _, ep := range ePoints {
+		wg.Add(1)
+		// poll endpoint in parallel
+		go func(epoint endpointRegistry.Endpoint) {
+			defer wg.Done()
+			otherCoordinator, errep := c.coordinatorInfoGetter(epoint)
+
+			// protect the failure map from concurrent access since we play with multiple endpoints in parallel
+			c.failingEndpoint.Lock()
+			defer c.failingEndpoint.Unlock()
+
+			if errep == nil {
+
+				// set the correct endpoint (it was not part of the serialization, it is private)
+				otherCoordinator.endpoint = &epoint
+
+				// Ok we got the coordinator associated to the endpoint
+				newCluster.Lock()
+				newCluster.index[otherCoordinator.ID] = otherCoordinator
+				newCluster.Unlock()
+
+				// In case it was register as failing, clear because now it is fine
+				delete(c.failingEndpoint.count, epoint.String())
+
+			} else {
+
+				// Bad new this endpoint is not responding!
+				count, ok := c.failingEndpoint.count[epoint.String()]
+				if ok {
+					count++
+				} else {
+					count = 1
+				}
+				c.failingEndpoint.count[epoint.String()] = count
+
+				// Check against max autorized failure before eviction
+				if count > MaxFailureBeforeRemove {
+					if err := c.registry.RemoveEndpoints([]endpointRegistry.Endpoint{epoint}); err == nil {
+						delete(c.failingEndpoint.count, epoint.String())
+						log.Println("Removing a failing endpoint: ", epoint.String())
+					}
+				}
+
+			}
+		}(ep)
+	}
+	wg.Wait()
+
+	// Be carefull the cluster can be modified while you are working with it. Get the pointer to cluster and keep working with it till the end of your logic to be consistent
+	c.cluster = newCluster
+
+	return nil
 }
