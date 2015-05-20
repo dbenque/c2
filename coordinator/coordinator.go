@@ -1,6 +1,7 @@
 package coordinator
 
 import (
+	"fmt"
 	"encoding/json"
 	"errors"
 	"io"
@@ -54,7 +55,7 @@ type Coordinator struct {
 	failingEndpoint      *endpointsFailure                 // Endpoint Failures detection
 	registrationTicker   *time.Ticker                      // Time to register again and again and again
 	refreshClusterTicker *time.Ticker                      // Time to refresh cluster again and again and again
-	requestHandler       *requestHanlderFct                // Function that will handle the request
+	requestHandler       requestHanlderFct                // Function that will handle the request
 }
 
 var instanceCoordinator *Coordinator
@@ -115,7 +116,7 @@ func (c *Coordinator) ProcessOrRedirect(anID ID, w http.ResponseWriter, r *http.
 
 	if anID == c.ID {
 		if c.requestHandler != nil {
-			(*c.requestHandler)(w, r)
+			(c.requestHandler)(w, r)
 			w.Header().Add("c2_processing", strconv.Itoa(int(c.ID)))
 			return nil
 		} else {
@@ -127,10 +128,14 @@ func (c *Coordinator) ProcessOrRedirect(anID ID, w http.ResponseWriter, r *http.
 	}
 
 	if targetCoordinator, ok := c.cluster.index[anID]; ok {
-		http.Redirect(w, r, targetCoordinator.endpoint.String(), http.StatusFound)
+		fmt.Println("Forwarding to:"+targetCoordinator.endpoint.String())
+		http.Redirect(w, r, "http://"+targetCoordinator.endpoint.String()+r.RequestURI, http.StatusFound)
 		w.Header().Add("c2_forwardedBy", strconv.Itoa(int(c.ID)))
 		return nil
 	}
+
+	w.WriteHeader(http.StatusInternalServerError)
+	w.Write([]byte(unknown_ID_in_cluster))
 
 	return errors.New(unknown_ID_in_cluster)
 

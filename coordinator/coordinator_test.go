@@ -1,6 +1,7 @@
 package coordinator
 
 import (
+	"fmt"
 	"io/ioutil"
 	"net"
 	"net/http"
@@ -20,6 +21,7 @@ const (
 	testRegistrationTickerDuration   = 10 * time.Millisecond
 	testRefreshClusterTickerDuration = 20 * time.Millisecond
 	testCoordinatorCount             = 33
+	testMagicStringForHandler = "MagicKeyForHandlerFct120478"
 )
 
 type coordinatorAndServer struct {
@@ -33,7 +35,7 @@ type coordinatorsByEndpointForTest struct {
 }
 
 // Start a new coordinator and its associated httptest.Server
-func newTestCoordinator(id ID, store distributedStore.DistributedStore, registry endpointRegistry.EndpointRegistry, allCoordinators *coordinatorsByEndpointForTest) *Coordinator {
+func newTestCoordinator(id ID, store distributedStore.DistributedStore, registry endpointRegistry.EndpointRegistry, allCoordinators *coordinatorsByEndpointForTest) (*Coordinator,*httptest.Server) {
 	c, _ := NewCoordinator(id, store, registry)
 
 	c.registrationTicker = time.NewTicker(testRegistrationTickerDuration)
@@ -63,7 +65,7 @@ func newTestCoordinator(id ID, store distributedStore.DistributedStore, registry
 	defer allCoordinators.Unlock()
 	allCoordinators.index[c.endpoint.String()] = coordinatorAndServer{ts, c}
 
-	return c
+	return c,ts
 }
 
 // start a complete cluster
@@ -74,11 +76,12 @@ func startManyCoordinators(count int, allCoordinators *coordinatorsByEndpointFor
 		wg.Add(1)
 		go func(aID int) {
 			defer wg.Done()
-			newTestCoordinator(ID(aID),
+			c,_:=newTestCoordinator(ID(aID),
 				store,
 				registry,
 				allCoordinators,
-			).Start()
+			)
+			c.Start()
 
 		}(i)
 	}
@@ -214,25 +217,49 @@ func getBody(URL string) string {
 
 }
 
-// func TestForwarding(t *testing.T) {
-//
-// 	allCoordinators := coordinatorsByEndpointForTest{index: make(map[string]*Coordinator)}
-// 	registry := endpointRegistry.NewMapEndpointRegistry()
-//
-// 	c1,s1:=serveNewCoordinator(ID(1),&allCoordinators,nil,registry)
-// 	defer s1.Close()
-//
-// 	time.Sleep(100*time.Millisecond) // time for the server to start
-//
-// 	// Test that the output is correct when no forwarding and no function handler defined
-// 	if getBody("http://"+c1.endpoint.String()+"/?ID=1")!=no_handler_function_defined {
-// 		t.Fatalf("Should have returned: %s",no_handler_function_defined)
-// 	}
-//
-// 	// Test that the output is correct when no forwarding and no function handler defined
-// 	if getBody("http://"+c1.endpoint.String()+"/?ID=9999")!=unknown_ID_in_cluster {
-// 		t.Fatalf("Should have returned: %s",unknown_ID_in_cluster)
-// 	}
-//
-//
-// }
+func TestForwarding(t *testing.T) {
+
+	allCoordinators := coordinatorsByEndpointForTest{index: make(map[string]coordinatorAndServer)}
+	registry := endpointRegistry.NewMapEndpointRegistry()
+	defer allCoordinators.close()
+
+	c1,s1:=newTestCoordinator(ID(1),nil,registry,&allCoordinators)
+	defer s1.Close()
+	c1.Start()
+
+	c2,s2:=newTestCoordinator(ID(2),nil,registry,&allCoordinators)
+	defer s2.Close()
+	c2.Start()
+
+	c2.requestHandler = func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(testMagicStringForHandler))
+	}
+
+	time.Sleep(10*time.Millisecond) // time for the server to start
+
+	// Test that the output is correct when no forwarding and no function handler defined
+	if getBody("http://"+c1.endpoint.String()+"/?ID=1")!=no_handler_function_defined {
+		t.Fatalf("Should have returned: %s",no_handler_function_defined)
+	}
+
+	// Test that the output is correct when no forwarding and no function handler defined
+	if getBody("http://"+c2.endpoint.String()+"/?ID=2")!=testMagicStringForHandler {
+		t.Fatalf("C2 Should have returned: %s",testMagicStringForHandler)
+	}
+
+	// Test that the output is correct when no forwarding and no function handler defined
+	if getBody("http://"+c1.endpoint.String()+"/?ID=9999")!=unknown_ID_in_cluster {
+		t.Fatalf("Should have returned: %s",unknown_ID_in_cluster)
+	}
+
+	// Test that the output is correct when no forwarding and no function handler defined
+	b:= getBody("http://"+c1.endpoint.String()+"/?ID=2")
+	if b!=testMagicStringForHandler {
+		t.Fatalf("C1 Should have returned: %s\n and not:%s",testMagicStringForHandler,b)
+	}
+
+	fmt.Println("%v",c1.cluster.index)
+
+
+}
