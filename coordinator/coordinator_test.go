@@ -1,14 +1,19 @@
 package coordinator
 
 import (
-	"errors"
+	"io/ioutil"
 	"net"
+	"net/http"
+	"net/http/httptest"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/dbenque/c2/distributedStore"
 	"github.com/dbenque/c2/endpointRegistry"
+
+	"github.com/gorilla/mux"
 )
 
 const (
@@ -17,46 +22,59 @@ const (
 	testCoordinatorCount             = 33
 )
 
-type coordinatorsByEndpointForTest struct {
-	sync.Mutex
-	index map[string]*Coordinator
+type coordinatorAndServer struct {
+	server      *httptest.Server
+	coordinator *Coordinator
 }
 
-func newTestCoordinator(ID CoordinatorID, endpoint endpointRegistry.Endpoint, store distributedStore.DistributedStore, registry endpointRegistry.EndpointRegistry, allCoordinators *coordinatorsByEndpointForTest) *Coordinator {
-	c, _ := NewCoordinator(ID, store, registry)
-	c.SetEndpoint(&endpoint)
+type coordinatorsByEndpointForTest struct {
+	sync.Mutex
+	index map[string]coordinatorAndServer
+}
+
+// Start a new coordinator and its associated httptest.Server
+func newTestCoordinator(id ID, store distributedStore.DistributedStore, registry endpointRegistry.EndpointRegistry, allCoordinators *coordinatorsByEndpointForTest) *Coordinator {
+	c, _ := NewCoordinator(id, store, registry)
 
 	c.registrationTicker = time.NewTicker(testRegistrationTickerDuration)
 	c.refreshClusterTicker = time.NewTicker(testRefreshClusterTickerDuration)
 
+	r := mux.NewRouter()
+	// Handler to return the information about the coordinator
+	r.HandleFunc("/"+CoordinatorInfoService, func(w http.ResponseWriter, r *http.Request) {
+		c.GetCoordinatorInfo(w, r)
+	})
+
+	// Other handler simulating a task for a given coordinator ID
+	r.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		id, _ := strconv.Atoi(r.FormValue("ID"))
+		c.ProcessOrRedirect(ID(id), w, r)
+	})
+
+	// Launching the httptest.Server
+	ts := httptest.NewServer(r)
+
+	// Get the endpoint returned by the httptest.Server and associate it to the coordinator
+	addr1, _ := net.ResolveTCPAddr("", ts.URL[7:])
+	c.SetEndpoint(&endpointRegistry.Endpoint{*addr1})
+
+	// Register the couple in the container used by the test
 	allCoordinators.Lock()
 	defer allCoordinators.Unlock()
-	allCoordinators.index[endpoint.String()] = c
-
-	// Function to mock the webservice call that normally get the coordinator info
-	c.coordinatorInfoGetter = func(ep endpointRegistry.Endpoint) (*Coordinator, error) {
-		allCoordinators.Lock()
-		defer allCoordinators.Unlock()
-
-		if otherCoordinator, ok := allCoordinators.index[ep.String()]; ok {
-			return otherCoordinator, nil
-		} else {
-			return nil, errors.New("can't get info")
-		}
-	}
+	allCoordinators.index[c.endpoint.String()] = coordinatorAndServer{ts, c}
 
 	return c
 }
 
+// start a complete cluster
 func startManyCoordinators(count int, allCoordinators *coordinatorsByEndpointForTest, store distributedStore.DistributedStore, registry endpointRegistry.EndpointRegistry) {
 	// declare registrators
 	var wg sync.WaitGroup
-	for i := 9000; i < 9000+count; i++ {
+	for i := 0; i < count; i++ {
 		wg.Add(1)
-		go func(ID int) {
+		go func(aID int) {
 			defer wg.Done()
-			newTestCoordinator(CoordinatorID(ID),
-				endpointRegistry.Endpoint{net.TCPAddr{net.IPv4(127, 0, 0, 1), ID, ""}},
+			newTestCoordinator(ID(aID),
 				store,
 				registry,
 				allCoordinators,
@@ -70,10 +88,31 @@ func startManyCoordinators(count int, allCoordinators *coordinatorsByEndpointFor
 	time.Sleep(10 * testRegistrationTickerDuration)
 }
 
+func (csmap *coordinatorsByEndpointForTest) stopCoordiantorAndServer(endpointStr string) {
+	csmap.Lock()
+	defer csmap.Unlock()
+
+	if cs, ok := csmap.index[endpointStr]; ok {
+		delete(csmap.index, endpointStr)
+		cs.coordinator.Stop()
+		cs.server.Close()
+	}
+}
+
+// empty the container and stop all the instances associated
+func (csmap *coordinatorsByEndpointForTest) close() {
+
+	for s, _ := range csmap.index {
+		csmap.stopCoordiantorAndServer(s)
+	}
+}
+
+// Test the fact that the Coordinator register correctly
 func TestCoordinatorRegistration(t *testing.T) {
 
 	// prepare test resources
-	allCoordinators := coordinatorsByEndpointForTest{index: make(map[string]*Coordinator)}
+	allCoordinators := coordinatorsByEndpointForTest{index: make(map[string]coordinatorAndServer)}
+	defer allCoordinators.close()
 	registry := endpointRegistry.NewMapEndpointRegistry()
 
 	startManyCoordinators(testCoordinatorCount, &allCoordinators, nil, registry)
@@ -90,11 +129,9 @@ func TestCoordinatorRegistration(t *testing.T) {
 	for _, ep := range eps {
 		control[ep.String()] = true
 	}
-
-	for i := 9000; i < 9000+testCoordinatorCount; i++ {
-		ep := endpointRegistry.Endpoint{net.TCPAddr{net.IPv4(127, 0, 0, 1), i, ""}}
-		if _, ok := control[ep.String()]; !ok {
-			t.Logf("The registry do not contains the following endpoint associated to port: %d", i)
+	for k, _ := range allCoordinators.index {
+		if _, ok := control[k]; !ok {
+			t.Logf("The registry do not contains the following endpoint: %d", k)
 			t.FailNow()
 		}
 	}
@@ -103,7 +140,8 @@ func TestCoordinatorRegistration(t *testing.T) {
 func TestCoordinatorRemovedWhenFailing(t *testing.T) {
 
 	// prepare test resources
-	allCoordinators := coordinatorsByEndpointForTest{index: make(map[string]*Coordinator)}
+	allCoordinators := coordinatorsByEndpointForTest{index: make(map[string]coordinatorAndServer)}
+	defer allCoordinators.close()
 	registry := endpointRegistry.NewMapEndpointRegistry()
 	startManyCoordinators(testCoordinatorCount, &allCoordinators, nil, registry)
 
@@ -115,22 +153,24 @@ func TestCoordinatorRemovedWhenFailing(t *testing.T) {
 	}
 
 	// Randomly kill half of them
-	stoppedCoordinators := coordinatorsByEndpointForTest{index: make(map[string]*Coordinator)}
+	stoppedCoordinators := coordinatorsByEndpointForTest{index: make(map[string]coordinatorAndServer)}
 	var wg sync.WaitGroup
 	countRemove := 0
-	for _, c := range allCoordinators.index {
+	for _, cAnds := range allCoordinators.index {
 		wg.Add(1)
-		go func(cc *Coordinator) {
+		go func(cs coordinatorAndServer) {
+
 			defer wg.Done()
+
+			// capture the instances that are stopped
 			stoppedCoordinators.Lock()
 			defer stoppedCoordinators.Unlock()
-			stoppedCoordinators.index[cc.endpoint.String()] = cc
-			allCoordinators.Lock()
-			defer allCoordinators.Unlock()
-			delete(allCoordinators.index, cc.endpoint.String())
-			cc.Stop()
+			epStr := cs.coordinator.endpoint.String()
+			stoppedCoordinators.index[epStr] = cs
 
-		}(c)
+			allCoordinators.stopCoordiantorAndServer(epStr)
+
+		}(cAnds)
 
 		countRemove++
 		if countRemove == testCoordinatorCount/2 {
@@ -143,6 +183,7 @@ func TestCoordinatorRemovedWhenFailing(t *testing.T) {
 	// Wait a little bit
 	time.Sleep(10 * testRefreshClusterTickerDuration)
 
+	// valide the number of coordinator remaining in the registry
 	eps, _ = registry.GetEndpoints()
 	if len(eps) != testCoordinatorCount-countRemove {
 		t.Logf("The registry do not contains expected number of endpoints: %d/%d", len(eps), testCoordinatorCount-testCoordinatorCount/2)
@@ -154,12 +195,44 @@ func TestCoordinatorRemovedWhenFailing(t *testing.T) {
 	for _, ep := range eps {
 		control[ep.String()] = true
 	}
-
-	for k, c := range stoppedCoordinators.index {
+	for k, cs := range stoppedCoordinators.index {
 		if _, ok := control[k]; ok {
-			t.Logf("The registry still contains the following endpoint associated to port: %d", c.endpoint.Port)
+			t.Logf("The registry still contains the following endpoint associated to port: %d", cs.coordinator.endpoint.Port)
 			t.FailNow()
 		}
 	}
 
 }
+
+func getBody(URL string) string {
+	resp, _ := http.Get(URL)
+
+	b, _ := ioutil.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	return string(b)
+
+}
+
+// func TestForwarding(t *testing.T) {
+//
+// 	allCoordinators := coordinatorsByEndpointForTest{index: make(map[string]*Coordinator)}
+// 	registry := endpointRegistry.NewMapEndpointRegistry()
+//
+// 	c1,s1:=serveNewCoordinator(ID(1),&allCoordinators,nil,registry)
+// 	defer s1.Close()
+//
+// 	time.Sleep(100*time.Millisecond) // time for the server to start
+//
+// 	// Test that the output is correct when no forwarding and no function handler defined
+// 	if getBody("http://"+c1.endpoint.String()+"/?ID=1")!=no_handler_function_defined {
+// 		t.Fatalf("Should have returned: %s",no_handler_function_defined)
+// 	}
+//
+// 	// Test that the output is correct when no forwarding and no function handler defined
+// 	if getBody("http://"+c1.endpoint.String()+"/?ID=9999")!=unknown_ID_in_cluster {
+// 		t.Fatalf("Should have returned: %s",unknown_ID_in_cluster)
+// 	}
+//
+//
+// }

@@ -16,20 +16,22 @@ import (
 )
 
 const (
-	CoordinatorInfoService   = "coordinator/Info" // URL for service giving coordinator info
-	MaxFailureBeforeRemove   = 1                  // Number of failure before removing an endpoint
-	SelfRegistrationInterval = 2 * time.Second    // Interval for self registration of the endpoint
-	RefreshClusterInterval   = 4 * time.Second    // Interval for refresh of the cluster
+	CoordinatorInfoService      = "coordinator/Info" // URL for service giving coordinator info
+	MaxFailureBeforeRemove      = 1                  // Number of failure before removing an endpoint
+	SelfRegistrationInterval    = 2 * time.Second    // Interval for self registration of the endpoint
+	RefreshClusterInterval      = 4 * time.Second    // Interval for refresh of the cluster
+	no_handler_function_defined = "No handler function defined"
+	unknown_ID_in_cluster       = "Unknown ID in the cluster"
 )
 
-type CoordinatorID int
+type ID int
 type coordinatorsIndex struct {
 	sync.Mutex
-	index map[CoordinatorID]*Coordinator
+	index map[ID]*Coordinator
 }
 
 func newCoordinatorsIndex() *coordinatorsIndex {
-	return &coordinatorsIndex{index: make(map[CoordinatorID]*Coordinator)}
+	return &coordinatorsIndex{index: make(map[ID]*Coordinator)}
 }
 
 type endpointsFailure struct {
@@ -41,24 +43,24 @@ func newEndpointsFailure() *endpointsFailure {
 	return &endpointsFailure{count: make(map[string]int)}
 }
 
-type coordinatorInfoGetterFct func(endpointRegistry.Endpoint) (*Coordinator, error)
+type requestHanlderFct func(w http.ResponseWriter, r *http.Request)
 
 type Coordinator struct {
-	store                 distributedStore.DistributedStore // Resource to store task to be coordinated (couchbase, ETCD, redis, ...)
-	registry              endpointRegistry.EndpointRegistry // Resource to register coordinator endpoint (couchbase, loadbalancer ...)
-	ID                    CoordinatorID                     // ID of the coordinator
-	endpoint              *endpointRegistry.Endpoint        // Endpoint for this coordinator
-	cluster               *coordinatorsIndex                // Cluster of coordinators ID->Coordinator
-	failingEndpoint       *endpointsFailure                 // Endpoint Failures detection
-	registrationTicker    *time.Ticker                      // Time to register again and again and again
-	refreshClusterTicker  *time.Ticker                      // Time to refresh cluster again and again and again
-	coordinatorInfoGetter coordinatorInfoGetterFct          // How to retrieve the Coordinator info when you have a endpoint (usually http call, except for unittest)
+	store                distributedStore.DistributedStore // Resource to store task to be coordinated (couchbase, ETCD, redis, ...)
+	registry             endpointRegistry.EndpointRegistry // Resource to register coordinator endpoint (couchbase, loadbalancer ...)
+	ID                   ID                                // ID of the coordinator
+	endpoint             *endpointRegistry.Endpoint        // Endpoint for this coordinator
+	cluster              *coordinatorsIndex                // Cluster of coordinators ID->Coordinator
+	failingEndpoint      *endpointsFailure                 // Endpoint Failures detection
+	registrationTicker   *time.Ticker                      // Time to register again and again and again
+	refreshClusterTicker *time.Ticker                      // Time to refresh cluster again and again and again
+	requestHandler       *requestHanlderFct                // Function that will handle the request
 }
 
 var instanceCoordinator *Coordinator
 
 //InitCoordinator this create the Coordinator resource and launch all the process for automatic registration and cluster discovery (and cleaning)
-func NewCoordinator(ID CoordinatorID, store distributedStore.DistributedStore, registry endpointRegistry.EndpointRegistry) (*Coordinator, error) {
+func NewCoordinator(ID ID, store distributedStore.DistributedStore, registry endpointRegistry.EndpointRegistry) (*Coordinator, error) {
 
 	c := Coordinator{
 		store,
@@ -69,7 +71,7 @@ func NewCoordinator(ID CoordinatorID, store distributedStore.DistributedStore, r
 		newEndpointsFailure(),
 		time.NewTicker(SelfRegistrationInterval),
 		time.NewTicker(RefreshClusterInterval),
-		getCoordinatorInfoForEndPoint,
+		nil,
 	}
 
 	// set the instance
@@ -109,14 +111,28 @@ func (c *Coordinator) SetEndpoint(e *endpointRegistry.Endpoint) {
 }
 
 //Redirect search the coordinator endpoint assiociated to the ID and redirect the request
-func (c *Coordinator) Redirect(ID CoordinatorID, w http.ResponseWriter, r *http.Request) error {
+func (c *Coordinator) ProcessOrRedirect(anID ID, w http.ResponseWriter, r *http.Request) error {
 
-	if targetCoordinator, ok := c.cluster.index[ID]; ok {
+	if anID == c.ID {
+		if c.requestHandler != nil {
+			(*c.requestHandler)(w, r)
+			w.Header().Add("c2_processing", strconv.Itoa(int(c.ID)))
+			return nil
+		} else {
+			w.WriteHeader(http.StatusInternalServerError)
+			w.Write([]byte(no_handler_function_defined))
+			w.Header().Add("c2_processing", strconv.Itoa(int(c.ID)))
+			return nil
+		}
+	}
+
+	if targetCoordinator, ok := c.cluster.index[anID]; ok {
 		http.Redirect(w, r, targetCoordinator.endpoint.String(), http.StatusFound)
+		w.Header().Add("c2_forwardedBy", strconv.Itoa(int(c.ID)))
 		return nil
 	}
 
-	return errors.New("Unknown ID in the cluster")
+	return errors.New(unknown_ID_in_cluster)
 
 }
 
@@ -178,7 +194,7 @@ func (c *Coordinator) refreshCluster() error {
 		// poll endpoint in parallel
 		go func(epoint endpointRegistry.Endpoint) {
 			defer wg.Done()
-			otherCoordinator, errep := c.coordinatorInfoGetter(epoint)
+			otherCoordinator, errep := getCoordinatorInfoForEndPoint(epoint)
 
 			// protect the failure map from concurrent access since we play with multiple endpoints in parallel
 			c.failingEndpoint.Lock()
