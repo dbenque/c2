@@ -184,6 +184,12 @@ func getCoordinatorInfoForEndPoint(endPoint endpointRegistry.Endpoint) (*Coordin
 	return c, nil
 }
 
+func (c *Coordinator) getClusterSize() int{
+	if c.cluster==nil { return 0}
+
+	return len(c.cluster.index)
+}
+
 func (c *Coordinator) refreshCluster() error {
 
 	ePoints, err := c.registry.GetEndpoints()
