@@ -17,9 +17,9 @@ import (
 )
 
 const (
-	testRegistrationTickerDuration   = 100 * time.Millisecond											// Don't put too low value else you may have some tcp resource issue
-	testRefreshClusterTickerDuration = 200 * time.Millisecond									// Don't put too low value else you may have some tcp resource issue
-	testCoordinatorCount             = 33																													// Don't put too high value else you may have some tcp resource issue
+	testRegistrationTickerDuration   = 100 * time.Millisecond // Don't put too low value else you may have some tcp resource issue
+	testRefreshClusterTickerDuration = 200 * time.Millisecond // Don't put too low value else you may have some tcp resource issue
+	testCoordinatorCount             = 33                     // Don't put too high value else you may have some tcp resource issue
 	testMagicStringForHandler        = "MagicKeyForHandlerFct120478"
 )
 
@@ -46,10 +46,17 @@ func newTestCoordinator(id ID, store distributedStore.DistributedStore, registry
 		c.GetCoordinatorInfo(w, r)
 	})
 
+	c.SetClusterIDGetter(func(r *http.Request) (ID, error) {
+		id, err := strconv.Atoi(r.FormValue("ID"))
+		if err!=nil {return ID(0),err}
+
+		return ID(id),nil
+	})
+
 	// Other handler simulating a task for a given coordinator ID
 	r.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		id, _ := strconv.Atoi(r.FormValue("ID"))
-		c.ProcessOrRedirect(ID(id), w, r)
+
+		c.ProcessOrRedirect(w, r)
 	})
 	r.HandleFunc("/ready", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -115,7 +122,7 @@ func (csmap *coordinatorsByEndpointForTest) stopCoordiantorAndServer(endpointStr
 	for {
 		if resp, err := http.Get("http://" + endpointStr + "/ready"); err != nil {
 			break
-		}else {
+		} else {
 			resp.Body.Close()
 		}
 		time.Sleep(3 * testRefreshClusterTickerDuration)

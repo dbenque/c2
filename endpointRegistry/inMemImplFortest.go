@@ -2,7 +2,6 @@ package endpointRegistry
 
 import (
 	"sync"
-	"fmt"
 )
 
 type wakeUpOnCount struct {
@@ -34,8 +33,6 @@ func (r *MapEndpointRegistry) AddEndpoints(endpoints []Endpoint) error {
 		r.endpoints[v.String()] = v
 	}
 
-	fmt.Println("Added:",len(r.endpoints))
-
 	r.checkWakeUp()
 
 	return nil
@@ -50,8 +47,6 @@ func (r *MapEndpointRegistry) RemoveEndpoints(endpoints []Endpoint) error {
 	for _, v := range endpoints {
 		delete(r.endpoints, v.String())
 	}
-
-	fmt.Println("Removed:",len(r.endpoints))
 
  	r.checkWakeUp()
 
@@ -70,8 +65,6 @@ func (r *MapEndpointRegistry) GetEndpoints() ([]Endpoint, error) {
 		endpoints = append(endpoints, v)
 	}
 
-	fmt.Println("Get:",len(r.endpoints))
-
 	return endpoints, nil
 }
 
@@ -85,8 +78,7 @@ func  (r *MapEndpointRegistry) WakeUpOnCount(target int) chan int{
 func (r*MapEndpointRegistry) checkWakeUp() {
  	// signal that the count match
  	if r.wakeUp!=nil && r.wakeUp.targetCount==len(r.endpoints) {
- 		go func(){ r.wakeUp.c <- r.wakeUp.targetCount
-			 fmt.Println("GIVING SIGNAL TO CHAN") }()		//Write in chan using goroutine to avoid blocking ... end thus deadlock
+ 		go func(){ r.wakeUp.c <- r.wakeUp.targetCount }()		//Write in chan using goroutine to avoid blocking ... end thus deadlock
  	}
 
 }

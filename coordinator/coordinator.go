@@ -1,9 +1,9 @@
 package coordinator
 
 import (
-	"fmt"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"io/ioutil"
 	"log"
@@ -44,8 +44,11 @@ func newEndpointsFailure() *endpointsFailure {
 	return &endpointsFailure{count: make(map[string]int)}
 }
 
+type clusterIDFromRequestFct func(r *http.Request) (ID, error)
+
 type requestHanlderFct func(w http.ResponseWriter, r *http.Request)
 
+//Coordinator This struct holds the field that allow hte coordinator to register in the cluster, discover the rest of the cluster, collect other coordinator failure. I also have method to process or redirect a query coorectly in the cluster.
 type Coordinator struct {
 	store                distributedStore.DistributedStore // Resource to store task to be coordinated (couchbase, ETCD, redis, ...)
 	registry             endpointRegistry.EndpointRegistry // Resource to register coordinator endpoint (couchbase, loadbalancer ...)
@@ -55,12 +58,13 @@ type Coordinator struct {
 	failingEndpoint      *endpointsFailure                 // Endpoint Failures detection
 	registrationTicker   *time.Ticker                      // Time to register again and again and again
 	refreshClusterTicker *time.Ticker                      // Time to refresh cluster again and again and again
-	requestHandler       requestHanlderFct                // Function that will handle the request
+	requestHandler       requestHanlderFct                 // Function that will handle the request
+	clusterIDGetter      clusterIDFromRequestFct           // Function that will extrat the clusterID based on a http.Request
 }
 
 var instanceCoordinator *Coordinator
 
-//InitCoordinator this create the Coordinator resource and launch all the process for automatic registration and cluster discovery (and cleaning)
+//NewCoordinator this create the Coordinator resource. To have it complete, you will need to set its Endpoint, its requestHandlerFct and its clusterIDFromRequestFct
 func NewCoordinator(ID ID, store distributedStore.DistributedStore, registry endpointRegistry.EndpointRegistry) (*Coordinator, error) {
 
 	c := Coordinator{
@@ -73,6 +77,7 @@ func NewCoordinator(ID ID, store distributedStore.DistributedStore, registry end
 		time.NewTicker(SelfRegistrationInterval),
 		time.NewTicker(RefreshClusterInterval),
 		nil,
+		nil,
 	}
 
 	// set the instance
@@ -80,6 +85,7 @@ func NewCoordinator(ID ID, store distributedStore.DistributedStore, registry end
 	return instanceCoordinator, nil
 }
 
+//Start Launch the periodic autoregistration of the coordinator and the periodic refreshment of the cluster seen by this coordinator
 func (c *Coordinator) Start() {
 	// Self Register frequently
 	go func() {
@@ -102,17 +108,37 @@ func (c *Coordinator) Start() {
 	}()
 }
 
+//Stop Stop function ends the auto registration of that coordinator and also ends the refreshment of the cluster for that coordinator.
 func (c *Coordinator) Stop() {
 	c.registrationTicker.Stop()
 	c.refreshClusterTicker.Stop()
 }
 
+//SetEndpoint set the endpoint under which this coordinator will be accessible by the other coordinator of the cluster.
 func (c *Coordinator) SetEndpoint(e *endpointRegistry.Endpoint) {
 	c.endpoint = e
 }
 
+//SetRequestHandler set the function that will handle the request once it hab been routed to the correct coordinator
+func (c *Coordinator) SetRequestHandler(f requestHanlderFct) {
+	c.requestHandler = f
+}
+//SetClusterIDGetter set the function that will extract the ID of the cluster based on the http.Request
+func (c *Coordinator) SetClusterIDGetter(f clusterIDFromRequestFct) {
+	c.clusterIDGetter = f
+}
+
 //Redirect search the coordinator endpoint assiociated to the ID and redirect the request
-func (c *Coordinator) ProcessOrRedirect(anID ID, w http.ResponseWriter, r *http.Request) error {
+func (c *Coordinator) ProcessOrRedirect(w http.ResponseWriter, r *http.Request) error {
+
+	if c.clusterIDGetter == nil {
+		return errors.New("No function defined for cluster identification.")
+	}
+
+	anID, err := c.clusterIDGetter(r)
+	if err != nil {
+		return err
+	}
 
 	if anID == c.ID {
 		if c.requestHandler != nil {
@@ -128,7 +154,7 @@ func (c *Coordinator) ProcessOrRedirect(anID ID, w http.ResponseWriter, r *http.
 	}
 
 	if targetCoordinator, ok := c.cluster.index[anID]; ok {
-		fmt.Println("Forwarding to:"+targetCoordinator.endpoint.String())
+		fmt.Println("Forwarding to:" + targetCoordinator.endpoint.String())
 		http.Redirect(w, r, "http://"+targetCoordinator.endpoint.String()+r.RequestURI, http.StatusFound)
 		w.Header().Add("c2_forwardedBy", strconv.Itoa(int(c.ID)))
 		return nil
@@ -141,6 +167,7 @@ func (c *Coordinator) ProcessOrRedirect(anID ID, w http.ResponseWriter, r *http.
 
 }
 
+//GetCoordinatorInfo this handler function returns all the information that define a coordinator within a cluster. It is the answer a coordinator will give to the other one while cluster discovery is performed.
 func (c *Coordinator) GetCoordinatorInfo(w http.ResponseWriter, r *http.Request) {
 
 	if c == nil {
@@ -184,8 +211,10 @@ func getCoordinatorInfoForEndPoint(endPoint endpointRegistry.Endpoint) (*Coordin
 	return c, nil
 }
 
-func (c *Coordinator) getClusterSize() int{
-	if c.cluster==nil { return 0}
+func (c *Coordinator) getClusterSize() int {
+	if c.cluster == nil {
+		return 0
+	}
 
 	return len(c.cluster.index)
 }
